@@ -29,7 +29,14 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': [
         'error',
-        { patterns: [{ group: ['*.renderer*'], message: 'Main/preload must not import renderer code.' }] }
+        {
+          patterns: [
+            {
+              group: ['*.renderer*', '@renderer/*', '**/renderer/**'],
+              message: 'Main/preload must not import renderer code.'
+            }
+          ]
+        }
       ]
     }
   },
