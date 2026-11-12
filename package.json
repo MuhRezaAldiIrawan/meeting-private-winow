@@ -1,0 +1,24 @@
+{
+  "name": "meeting-private-window",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private Presenter Notes - catatan presenter yang tidak ikut tertangkap saat screen share",
+  "main": "out/main/index.js",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "24.19.2",
+    "electron": "45.3.1",
+    "electron-builder": "26.18.0",
+    "electron-vite": "6.0.0",
+    "eslint": "^10.14.0",
+    "jsdom": "31.0.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  },
+  "dependencies": {
+    "dompurify": "3.4.17",
+    "marked": "18.2.0"
+  }
+}
