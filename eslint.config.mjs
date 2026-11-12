@@ -2,9 +2,7 @@ import js from '@eslint/js'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  {
-    ignores: ['out/**', 'dist/**', 'node_modules/**', 'release/**']
-  },
+  { ignores: ['out/**', 'dist/**', 'node_modules/**', 'release/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
   {
@@ -15,10 +13,6 @@ export default tseslint.config(
       }
     },
     rules: {
-      '@typescript-eslint/no-misused-promises': [
-        'error',
-        { checksVoidReturn: { attributes: false } }
-      ],
       '@typescript-eslint/no-floating-promises': 'error',
       '@typescript-eslint/consistent-type-imports': [
         'error',
@@ -27,8 +21,7 @@ export default tseslint.config(
       '@typescript-eslint/no-unused-vars': [
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }
-      ],
-      'no-console': 'off'
+      ]
     }
   },
   {
@@ -36,14 +29,7 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': [
         'error',
-        {
-          patterns: [
-            {
-              group: ['*.renderer*'],
-              message: 'Main/preload must not import renderer code.'
-            }
-          ]
-        }
+        { patterns: [{ group: ['*.renderer*'], message: 'Main/preload must not import renderer code.' }] }
       ]
     }
   },
@@ -56,8 +42,7 @@ export default tseslint.config(
           patterns: [
             {
               group: ['electron', 'node:*'],
-              message:
-                'Renderer must not import Electron or Node builtins. Use the preload bridge (window.presenter).'
+              message: 'Renderer must not import Electron or Node builtins. Use the preload bridge (window.presenter).'
             }
           ]
         }
