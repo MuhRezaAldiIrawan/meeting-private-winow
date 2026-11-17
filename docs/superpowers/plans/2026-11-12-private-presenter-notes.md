@@ -1151,7 +1151,7 @@ git commit -m "feat: add pure protection state machine with fail-visible semanti
 **Interfaces:**
 - Consumes: nothing (pure `node:fs`)
 - Produces:
-  - `writeFileAtomic(filePath: string, content: string): Promise<void>` and `updateFileAtomic(filePath: string, update: (current: string) => string): Promise<string>` in `src/main/storage/atomicWrite.ts` — shared by `NotesStore` (Task 4) and `SettingsStore` (Task 5)
+  - `readFileAtomic(filePath: string): Promise<string | null>`, `writeFileAtomic(filePath: string, content: string): Promise<void>` and `updateFileAtomic(filePath: string, update: (current: string) => string): Promise<string>` in `src/main/storage/atomicWrite.ts` — shared by `NotesStore` (Task 4) and `SettingsStore` (Task 5)
   - `class NotesStore`
     - `constructor(filePath: string)`
     - `async read(): Promise<string>`
@@ -1163,7 +1163,7 @@ Create `src/main/storage/NotesStore.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NotesStore } from './NotesStore'
@@ -1226,6 +1226,32 @@ describe('NotesStore', () => {
     expect(entries).toEqual(['notes.md'])
   })
 
+  it('removes the temporary file when the rename fails', async () => {
+    // The rename fails only when the target exists as a DIRECTORY — the one failure
+    // that happens AFTER the temp file has been written. The other failing-write case
+    // (a parent path segment that is a file) fails earlier, at `mkdir`, so it never
+    // creates a temp file and cannot prove the cleanup works.
+    const target = join(dir, 'notes.md')
+    await mkdir(target)
+    const store = new NotesStore(target)
+    await expect(store.write('new content')).rejects.toThrow()
+    const entries = await readdir(dir)
+    expect(entries).toEqual(['notes.md'])
+  })
+
+  it('writes the file atomically, never exposing a partial write', async () => {
+    // Atomic write = write to a temp file, then rename over the target. The rename
+    // swaps the file's identity, so a reader sees either the old content or the new
+    // content, never a half-written file. A direct in-place write keeps the same file
+    // and can be observed mid-write.
+    const store = new NotesStore(file)
+    await store.write('first')
+    const before = (await stat(file)).ino
+    await store.write('second')
+    const after = (await stat(file)).ino
+    expect(after).not.toBe(before)
+  })
+
   it('serializes overlapping writes without corrupting the file', async () => {
     const store = new NotesStore(file)
     await store.write('initial')
@@ -1242,6 +1268,33 @@ describe('NotesStore', () => {
     }
     const entries = await readdir(dir)
     expect(entries).toEqual(['notes.md'])
+  })
+
+  it('does not fail when a read overlaps a write', async () => {
+    // On Windows, renaming onto a file that another handle still has open fails with
+    // EPERM. A read racing a write therefore breaks the WRITE — the user sees a
+    // spurious "Couldn't save notes". Both operations must go through the same
+    // per-path queue so they cannot overlap.
+    const store = new NotesStore(file)
+    await store.write('initial')
+    for (let round = 0; round < 20; round++) {
+      const results = await Promise.allSettled([
+        store.write('A'.repeat(20_000)),
+        store.read()
+      ])
+      expect(results[0].status).toBe('fulfilled')
+      expect(results[1].status).toBe('fulfilled')
+    }
+  })
+
+  it('re-throws a read error that is not a missing file', async () => {
+    // Only ENOENT means "no file yet". Any other read error (here: the target is a
+    // directory) must surface, not be swallowed into an empty string — otherwise the
+    // user sees their notes silently disappear.
+    const target = join(dir, 'notes.md')
+    await mkdir(target)
+    const store = new NotesStore(target)
+    await expect(store.read()).rejects.toThrow()
   })
 
   it('overwrites existing content', async () => {
@@ -1265,15 +1318,29 @@ Create `src/main/storage/atomicWrite.ts`:
 ```ts
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 /**
- * Writes to the same path are serialized so two overlapping saves cannot race on the
- * temporary file. Without this, the second write removes the first write's temp file
+ * Every operation on a given path — reads and writes alike — is serialized, so two
+ * overlapping operations cannot race.
+ *
+ * Writer vs. writer: without this, the second write removes the first write's temp file
  * and the first `rename` fails with ENOENT — the user sees a spurious "couldn't save".
+ *
+ * Reader vs. writer: on Windows, renaming onto a file that another handle still has
+ * open fails with EPERM. A read racing a write therefore makes the *write* fail.
  */
 const queues = new Map<string, Promise<void>>()
 
 let tempCounter = 0
+
+/**
+ * Windows can transiently refuse a rename while another program — a virus scanner, a
+ * file indexer, a sync client — holds the file open. Retrying briefly turns that
+ * transient failure into a successful save instead of a spurious error to the user.
+ */
+const RENAME_ATTEMPTS = 5
+const RENAME_RETRY_MS = 20
 
 /**
  * Runs `task` after any previously queued task for the same path has settled, so tasks
@@ -1295,6 +1362,16 @@ function enqueue<T>(filePath: string, task: () => Promise<T>): Promise<T> {
   return current
 }
 
+/**
+ * Reads a file through the per-path queue, so the read never overlaps a write to the
+ * same file. Resolves to `null` when the file does not exist; any other read error is
+ * re-thrown so the caller can tell "no file yet" apart from "the file is unreadable".
+ */
+export function readFileAtomic(filePath: string): Promise<string | null> {
+  return enqueue(filePath, () => readFileIfExists(filePath))
+}
+
+/** Writes a file through the per-path queue. */
 export function writeFileAtomic(filePath: string, content: string): Promise<void> {
   return enqueue(filePath, () => writeAtomic(filePath, content))
 }
@@ -1310,18 +1387,18 @@ export function updateFileAtomic(
   update: (current: string) => string
 ): Promise<string> {
   return enqueue(filePath, async () => {
-    const current = await readFileIfExists(filePath)
+    const current = (await readFileIfExists(filePath)) ?? ''
     const next = update(current)
     await writeAtomic(filePath, next)
     return next
   })
 }
 
-async function readFileIfExists(filePath: string): Promise<string> {
+async function readFileIfExists(filePath: string): Promise<string | null> {
   try {
     return await readFile(filePath, 'utf8')
   } catch (error) {
-    if (isNotFound(error)) return ''
+    if (isNotFound(error)) return null
     throw error
   }
 }
@@ -1332,11 +1409,29 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
   const tempPath = `${filePath}.${process.pid}.${tempCounter++}.tmp`
   try {
     await writeFile(tempPath, content, 'utf8')
-    await rename(tempPath, filePath)
+    await renameWithRetry(tempPath, filePath)
   } catch (error) {
     await rm(tempPath, { force: true }).catch(() => undefined)
     throw error
   }
+}
+
+async function renameWithRetry(tempPath: string, filePath: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await rename(tempPath, filePath)
+      return
+    } catch (error) {
+      if (attempt >= RENAME_ATTEMPTS || !isTransient(error)) throw error
+      await delay(RENAME_RETRY_MS * attempt)
+    }
+  }
+}
+
+/** Errors that mean "try again shortly" rather than "this will never work". */
+function isTransient(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code
+  return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES'
 }
 
 function isNotFound(error: unknown): boolean {
@@ -1351,39 +1446,27 @@ function isNotFound(error: unknown): boolean {
 Create `src/main/storage/NotesStore.ts`:
 
 ```ts
-import { readFile } from 'node:fs/promises'
-import { writeFileAtomic } from './atomicWrite'
+import { readFileAtomic, writeFileAtomic } from './atomicWrite'
 
 export class NotesStore {
   constructor(private readonly filePath: string) {}
 
   async read(): Promise<string> {
-    try {
-      return await readFile(this.filePath, 'utf8')
-    } catch (error) {
-      if (isNotFound(error)) return ''
-      throw error
-    }
+    // The read goes through the same per-path queue as the write: on Windows, a read
+    // that overlaps a write makes the write's rename fail with EPERM.
+    return (await readFileAtomic(this.filePath)) ?? ''
   }
 
   async write(content: string): Promise<void> {
     await writeFileAtomic(this.filePath, content)
   }
 }
-
-function isNotFound(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: string }).code === 'ENOENT'
-  )
-}
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/main/storage/NotesStore.test.ts`
-Expected: PASS — 8 tests passed
+Expected: PASS — 12 tests passed
 
 - [ ] **Step 5: Commit**
 
@@ -1517,11 +1600,10 @@ Expected: FAIL — `Cannot find module './SettingsStore'`
 Create `src/main/storage/SettingsStore.ts`:
 
 ```ts
-import { readFile } from 'node:fs/promises'
 import type { SettingsData } from '@shared/types'
 import { DEFAULT_MODEL } from '@shared/types'
 import { createLogger } from '@shared/logger'
-import { updateFileAtomic } from './atomicWrite'
+import { readFileAtomic, updateFileAtomic } from './atomicWrite'
 
 export { DEFAULT_MODEL }
 
@@ -1532,9 +1614,9 @@ export class SettingsStore {
 
   async read(): Promise<SettingsData> {
     try {
-      return parseSettings(await readFile(this.filePath, 'utf8'))
+      const raw = await readFileAtomic(this.filePath)
+      return parseSettings(raw ?? '')
     } catch (error) {
-      if (isNotFound(error)) return defaultSettings()
       log.warn('settings file unreadable, using defaults', { error: String(error) })
       return defaultSettings()
     }
@@ -1590,14 +1672,6 @@ function parseSettings(raw: string): SettingsData {
     apiKey: typeof data.apiKey === 'string' ? data.apiKey : defaults.apiKey,
     model: typeof data.model === 'string' && data.model.length > 0 ? data.model : defaults.model
   }
-}
-
-function isNotFound(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: string }).code === 'ENOENT'
-  )
 }
 ```
 
