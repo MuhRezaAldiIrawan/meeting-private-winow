@@ -19,7 +19,7 @@ These apply to every task. Copy them verbatim; do not re-derive.
 - **`contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`** on the BrowserWindow.
 - **Fail-visible:** status is exactly one of `'off' | 'on' | 'error'`. `'on'` is reachable ONLY through a successful adapter call. An adapter throw yields `'error'`, never `'on'`.
 - **Protection defaults to OFF** on every launch. Default OFF is independent of the first-run notice acknowledgement flag.
-- **API key never leaves the main process.** `getSettings()` returns `{ hasApiKey: boolean, model: string, hasAcknowledgedNotice: boolean }` — never the key value. Logger redacts `apiKey`, `authorization`, `token`, `bearer`.
+- **API key never leaves the main process.** `getSettings()` returns `{ hasApiKey: boolean, model: string, hasAcknowledgedNotice: boolean }` — never the key value. The logger redacts metadata keys by containment over normalized key names (lowercased, non-alphanumerics stripped), so `apiKey`, `api_key`, `api-key`, `DATABYTE_API_KEY`, `accessToken`, `clientSecret` and any key containing `apikey`, `authorization`, `token`, `bearer`, `password` or `secret` are replaced with `[REDACTED]`. The single carve-out is a key normalizing to `hasapikey` with a boolean value (`PublicSettings.hasApiKey`); a non-boolean under that name is still redacted. The logger also serializes `Error` as `{ name, message, stack }`, `Date` as its ISO 8601 string, scrubs secret-shaped substrings (`sk-...`, `Bearer ...`, `token=...`) out of free text and error messages, and marks circular references as `[Circular]`.
 - **UI labels are in English.** AI error messages are in **Indonesian** (PRD FR-15 explicitly requires it). This is a deliberate exception, not an inconsistency.
 - **AI Assist sends only the user's typed question.** Note content is never sent as context.
 - **All data is local.** No telemetry, no analytics, no network calls other than the AI request.
@@ -455,7 +455,7 @@ git commit -m "chore: scaffold Electron project with strict TypeScript toolchain
   - `ProtectionStatus = 'off' | 'on' | 'error'`
   - `ProtectionSnapshot { status: ProtectionStatus; reason: string | null; updatedAt: number }`
   - `AiErrorCode` union, `AiResult { ok: boolean; answer: string; errorCode: AiErrorCode | null; message: string }`
-  - `PublicSettings { hasApiKey: boolean; model: string }`
+  - `PublicSettings { hasApiKey: boolean; model: string; hasAcknowledgedNotice: boolean }`
   - `logger.info(message: string, meta?: Record<string, unknown>): void` — redacts sensitive keys before printing
 
 - [ ] **Step 1: Write the failing test**
@@ -469,6 +469,13 @@ import { createLogger } from './logger'
 afterEach(() => {
   vi.restoreAllMocks()
 })
+
+/** Run `emit` against a fresh logger and return everything it printed as one string. */
+function captureLog(emit: (logger: ReturnType<typeof createLogger>) => void): string {
+  const spy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+  emit(createLogger('main'))
+  return spy.mock.calls.map((c) => c.join(' ')).join('\n')
+}
 
 describe('createLogger', () => {
   it('redacts apiKey from metadata', () => {
@@ -496,6 +503,142 @@ describe('createLogger', () => {
     const meta = { apiKey: 'sk-db-secret' }
     logger.info('x', meta)
     expect(meta.apiKey).toBe('sk-db-secret')
+  })
+
+  it('redacts bearer keys', () => {
+    const output = captureLog((logger) => logger.info('request', { bearer: 'abc123' }))
+    expect(output).not.toContain('abc123')
+    expect(output).toContain('[REDACTED]')
+  })
+
+  it('redacts a secret nested two levels deep', () => {
+    const output = captureLog((logger) =>
+      logger.info('nested', { outer: { inner: { token: 'deep-secret' } } })
+    )
+    expect(output).not.toContain('deep-secret')
+    expect(output).toContain('[REDACTED]')
+  })
+
+  it('redacts a secret inside an array element', () => {
+    const output = captureLog((logger) =>
+      logger.info('list', { items: [{ model: 'MiniMax-M3' }, { apiKey: 'sk-array-secret' }] })
+    )
+    expect(output).not.toContain('sk-array-secret')
+    expect(output).toContain('MiniMax-M3')
+  })
+
+  it('redacts case variants of apiKey', () => {
+    const output = captureLog((logger) =>
+      logger.info('variants', { APIKEY: 'upper-secret', ApiKey: 'title-secret' })
+    )
+    expect(output).not.toContain('upper-secret')
+    expect(output).not.toContain('title-secret')
+  })
+
+  it('redacts the DATABYTE_API_KEY env-shaped key', () => {
+    const output = captureLog((logger) =>
+      logger.info('env', { DATABYTE_API_KEY: 'sk-env-secret' })
+    )
+    expect(output).not.toContain('sk-env-secret')
+    expect(output).toContain('[REDACTED]')
+  })
+
+  it('redacts compound credential key names', () => {
+    const output = captureLog((logger) =>
+      logger.info('tokens', {
+        accessToken: 'access-secret',
+        refreshToken: 'refresh-secret',
+        idToken: 'id-secret',
+        clientSecret: 'client-secret',
+        api_key: 'snake-secret',
+        'api-key': 'kebab-secret'
+      })
+    )
+    for (const secret of [
+      'access-secret',
+      'refresh-secret',
+      'id-secret',
+      'client-secret',
+      'snake-secret',
+      'kebab-secret'
+    ]) {
+      expect(output).not.toContain(secret)
+    }
+  })
+
+  it('keeps the hasApiKey boolean intact', () => {
+    const output = captureLog((logger) => logger.info('settings', { hasApiKey: true }))
+    expect(output).toContain('"hasApiKey":true')
+    expect(output).not.toContain('[REDACTED]')
+  })
+
+  it('redacts hasApiKey when its value is not a boolean', () => {
+    const output = captureLog((logger) => logger.info('settings', { hasApiKey: 'sk-live-xyz' }))
+    expect(output).not.toContain('sk-live-xyz')
+    expect(output).toContain('"hasApiKey":"[REDACTED]"')
+  })
+
+  it('scrubs secrets out of Error messages while keeping the rest', () => {
+    const output = captureLog((logger) =>
+      logger.error('request failed', { err: new Error('boom: sk-db-secret') })
+    )
+    expect(output).not.toContain('sk-db-secret')
+    expect(output).toContain('boom')
+    expect(output).toContain('"name":"Error"')
+    expect(output).toContain('"stack"')
+  })
+
+  it('serializes a Date as its ISO 8601 string', () => {
+    const date = new Date('2026-11-17T03:04:05.000Z')
+    const output = captureLog((logger) => logger.info('stamp', { at: date }))
+    expect(output).toContain(date.toISOString())
+    expect(output).not.toContain('{}')
+  })
+
+  it('marks circular references instead of recursing forever', () => {
+    const node: Record<string, unknown> = { model: 'MiniMax-M3' }
+    node.self = node
+    const output = captureLog((logger) => logger.info('cycle', { node }))
+    expect(output).toContain('[Circular]')
+    expect(output).toContain('MiniMax-M3')
+  })
+
+  it('expands a shared object at every reference and only marks real cycles', () => {
+    const shared = { model: 'MiniMax-M3' }
+    const output = captureLog((logger) => logger.info('shared', { a: shared, b: shared }))
+    expect(output).not.toContain('[Circular]')
+    expect((output.match(/MiniMax-M3/g) ?? []).length).toBe(2)
+  })
+
+  it('does not redact safe diagnostic fields', () => {
+    const output = captureLog((logger) =>
+      logger.info('status', {
+        model: 'MiniMax-M3',
+        status: 'on',
+        reason: 'user',
+        updatedAt: 1,
+        scope: 'main',
+        answer: 'ok',
+        errorCode: 'timeout'
+      })
+    )
+    for (const safe of ['MiniMax-M3', '"status":"on"', '"reason":"user"', '"errorCode":"timeout"']) {
+      expect(output).toContain(safe)
+    }
+    expect(output).not.toContain('[REDACTED]')
+  })
+
+  it('scrubs secret-shaped substrings out of free text', () => {
+    const output = captureLog((logger) =>
+      logger.info('note', {
+        detail: 'used Bearer abc123 with api_key=xyz789 then sk_live_topsecret'
+      })
+    )
+    expect(output).not.toContain('abc123')
+    expect(output).not.toContain('xyz789')
+    expect(output).not.toContain('sk_live_topsecret')
+    expect(output).toContain('Bearer [REDACTED]')
+    expect(output).toContain('used')
   })
 })
 ```
@@ -556,7 +699,57 @@ export interface SettingsData {
 Create `src/shared/logger.ts`:
 
 ```ts
-const SENSITIVE_KEYS = new Set(['apikey', 'authorization', 'token', 'bearer', 'password', 'secret'])
+/**
+ * Substrings that mark a metadata key as holding a credential. Keys are normalized by
+ * lowercasing and dropping every non-alphanumeric character first, so `apiKey`, `api_key`,
+ * `api-key`, `DATABYTE_API_KEY` and `accessToken` are all matched by containment rather
+ * than by exact lookup.
+ */
+const SENSITIVE_KEY_FRAGMENTS = ['apikey', 'authorization', 'token', 'bearer', 'password', 'secret']
+
+/**
+ * Keys that collide with the fragments above but whose BOOLEAN value is legitimate public
+ * diagnostics — `PublicSettings.hasApiKey` is part of the IPC contract. Only booleans are
+ * preserved; a string smuggled under the same name is still redacted.
+ */
+const BOOLEAN_SAFE_KEYS = new Set(['hasapikey'])
+
+const REDACTED = '[REDACTED]'
+
+/** `DATABYTE_API_KEY` -> `databyteapikey`, `api-key` -> `apikey`, `ApiKey` -> `apikey`. */
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = normalizeKey(key)
+  return SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))
+}
+
+function isBooleanCarveOut(key: string, value: unknown): boolean {
+  return typeof value === 'boolean' && BOOLEAN_SAFE_KEYS.has(normalizeKey(key))
+}
+
+/** Provider API keys: `sk-...`, plus the Stripe-style `sk_live_...` / `sk_test_...` shapes. */
+const PROVIDER_KEY_PATTERN = /\bsk[-_][A-Za-z0-9_-]+/g
+
+/** `Bearer <credential>` — keeps the scheme word, drops the credential. Case-insensitive. */
+const BEARER_PATTERN = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi
+
+/** `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`. */
+const ASSIGNED_SECRET_PATTERN =
+  /\b(api[_-]?key|authorization|token|secret|password)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi
+
+/**
+ * Removes secret-shaped substrings from free text. Used for string metadata values and for
+ * `Error` messages/stacks, which are diagnostic text we cannot otherwise key-match.
+ */
+function scrubSecrets(text: string): string {
+  return text
+    .replace(ASSIGNED_SECRET_PATTERN, (_match, name: string, separator: string) => `${name}${separator}${REDACTED}`)
+    .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
+    .replace(PROVIDER_KEY_PATTERN, REDACTED)
+}
 
 export interface Logger {
   info(message: string, meta?: Record<string, unknown>): void
@@ -564,16 +757,47 @@ export interface Logger {
   error(message: string, meta?: Record<string, unknown>): void
 }
 
-function redact(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redact)
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = SENSITIVE_KEYS.has(key.toLowerCase()) ? '[REDACTED]' : redact(val)
+/**
+ * Rebuilds `value` with sensitive data replaced. `seen` holds only the objects on the
+ * current recursion path, so a shared object reached twice by different properties is
+ * expanded both times and only a real back-edge is reported as `[Circular]`.
+ */
+function walk(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === 'string') return scrubSecrets(value)
+  if (value instanceof Date) return value.toISOString()
+  if (value instanceof Error) {
+    return {
+      name: scrubSecrets(value.name),
+      message: scrubSecrets(value.message),
+      stack: value.stack === undefined ? null : scrubSecrets(value.stack)
     }
+  }
+  if (value !== null && typeof value === 'object') {
+    if (seen.has(value)) return '[Circular]'
+    seen.add(value)
+    let out: unknown
+    if (Array.isArray(value)) {
+      out = (value as unknown[]).map((item) => walk(item, seen))
+    } else {
+      const source = value as Record<string, unknown>
+      const rebuilt: Record<string, unknown> = {}
+      for (const [key, val] of Object.entries(source)) {
+        rebuilt[key] = isBooleanCarveOut(key, val)
+          ? val
+          : isSensitiveKey(key)
+            ? REDACTED
+            : walk(val, seen)
+      }
+      out = rebuilt
+    }
+    seen.delete(value)
     return out
   }
   return value
+}
+
+function redact(value: unknown): unknown {
+  return walk(value, new WeakSet<object>())
 }
 
 export function createLogger(scope: string): Logger {
@@ -594,7 +818,7 @@ export const logger = createLogger('app')
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/shared/logger.test.ts`
-Expected: PASS — 3 tests passed
+Expected: PASS — 17 tests passed
 
 - [ ] **Step 5: Commit**
 
