@@ -62,7 +62,11 @@ export default tseslint.config(
       '@typescript-eslint/no-unsafe-assignment': 'off',
       '@typescript-eslint/no-unsafe-member-access': 'off',
       '@typescript-eslint/no-unsafe-argument': 'off',
-      '@typescript-eslint/no-unsafe-call': 'off'
+      '@typescript-eslint/no-unsafe-call': 'off',
+      // Async mocks such as `vi.fn(async () => undefined)` must resolve rather than return a
+      // value, and `Promise.resolve()` stubs would change the shape under test. The await-free
+      // body is the point, so this rule is noise in test files.
+      '@typescript-eslint/require-await': 'off'
     }
   }
 )
