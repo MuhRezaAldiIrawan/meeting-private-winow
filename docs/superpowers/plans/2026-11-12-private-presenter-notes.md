@@ -47,6 +47,7 @@ src/
 │  │  ├─ ProtectionService.ts       ← pure state machine, NO electron import
 │  │  └─ electronAdapter.ts         ← adapter wrapping win.setContentProtection
 │  ├─ storage/
+│  │  ├─ atomicWrite.ts             ← atomic file write, serialized per path
 │  │  ├─ NotesStore.ts              ← atomic read/write of notes.md
 │  │  └─ SettingsStore.ts           ← read/write of settings.json
 │  ├─ ai/
@@ -1144,12 +1145,13 @@ git commit -m "feat: add pure protection state machine with fail-visible semanti
 ## Task 4: Notes storage with atomic write
 
 **Files:**
-- Create: `src/main/storage/NotesStore.ts`
+- Create: `src/main/storage/atomicWrite.ts`, `src/main/storage/NotesStore.ts`
 - Test: `src/main/storage/NotesStore.test.ts`
 
 **Interfaces:**
 - Consumes: nothing (pure `node:fs`)
 - Produces:
+  - `writeFileAtomic(filePath: string, content: string): Promise<void>` in `src/main/storage/atomicWrite.ts` — shared by `NotesStore` (Task 4) and `SettingsStore` (Task 5)
   - `class NotesStore`
     - `constructor(filePath: string)`
     - `async read(): Promise<string>`
@@ -1207,9 +1209,39 @@ describe('NotesStore', () => {
   it('does not corrupt the previous content when the write fails', async () => {
     const store = new NotesStore(file)
     await store.write('original')
-    const failing = new NotesStore(join(dir, 'missing-dir', 'notes.md'))
+    // The parent path segment is an existing FILE, so the write genuinely fails.
+    // (A path under a missing directory would NOT fail: `write` creates the
+    // directory first, so the write would succeed and this test could never fail.)
+    const failing = new NotesStore(join(file, 'nested.md'))
     await expect(failing.write('new content')).rejects.toThrow()
     await expect(store.read()).resolves.toBe('original')
+  })
+
+  it('leaves no temporary file behind when the write fails', async () => {
+    const store = new NotesStore(file)
+    await store.write('original')
+    const failing = new NotesStore(join(file, 'nested.md'))
+    await expect(failing.write('new content')).rejects.toThrow()
+    const entries = await readdir(dir)
+    expect(entries).toEqual(['notes.md'])
+  })
+
+  it('serializes overlapping writes without corrupting the file', async () => {
+    const store = new NotesStore(file)
+    await store.write('initial')
+    // Overlapping saves happen in practice: the renderer debounces edits, but a slow
+    // disk can still overlap two saves. Repeat enough rounds that a race is caught
+    // reliably rather than one time in three.
+    for (let round = 0; round < 20; round++) {
+      const first = store.write('A'.repeat(20_000))
+      const second = store.write('B'.repeat(20_000))
+      await expect(Promise.all([first, second])).resolves.toBeDefined()
+      const content = await store.read()
+      // The file must hold exactly one complete write — never a mix of the two.
+      expect(content === 'A'.repeat(20_000) || content === 'B'.repeat(20_000)).toBe(true)
+    }
+    const entries = await readdir(dir)
+    expect(entries).toEqual(['notes.md'])
   })
 
   it('overwrites existing content', async () => {
@@ -1228,11 +1260,56 @@ Expected: FAIL — `Cannot find module './NotesStore'`
 
 - [ ] **Step 3: Write minimal implementation**
 
+Create `src/main/storage/atomicWrite.ts`:
+
+```ts
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+
+/**
+ * Writes to the same path are serialized so two overlapping saves cannot race on the
+ * temporary file. Without this, the second write removes the first write's temp file
+ * and the first `rename` fails with ENOENT — the user sees a spurious "couldn't save".
+ */
+const queues = new Map<string, Promise<void>>()
+
+let tempCounter = 0
+
+export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const key = resolve(filePath)
+  const previous = queues.get(key) ?? Promise.resolve()
+  const current = previous.then(() => writeAtomic(filePath, content))
+  // The queue must survive a failed write, so it tracks the settled promise.
+  const settled = current.then(
+    () => undefined,
+    () => undefined
+  )
+  queues.set(key, settled)
+  void settled.then(() => {
+    if (queues.get(key) === settled) queues.delete(key)
+  })
+  return current
+}
+
+async function writeAtomic(filePath: string, content: string): Promise<void> {
+  await mkdir(dirname(filePath), { recursive: true })
+  // A unique temp name keeps concurrent writers on different paths from colliding.
+  const tempPath = `${filePath}.${process.pid}.${tempCounter++}.tmp`
+  try {
+    await writeFile(tempPath, content, 'utf8')
+    await rename(tempPath, filePath)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+```
+
 Create `src/main/storage/NotesStore.ts`:
 
 ```ts
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { writeFileAtomic } from './atomicWrite'
 
 export class NotesStore {
   constructor(private readonly filePath: string) {}
@@ -1247,15 +1324,7 @@ export class NotesStore {
   }
 
   async write(content: string): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true })
-    const tempPath = `${this.filePath}.tmp`
-    try {
-      await writeFile(tempPath, content, 'utf8')
-      await rename(tempPath, this.filePath)
-    } catch (error) {
-      await rm(tempPath, { force: true }).catch(() => undefined)
-      throw error
-    }
+    await writeFileAtomic(this.filePath, content)
   }
 }
 
@@ -1271,12 +1340,12 @@ function isNotFound(error: unknown): boolean {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/main/storage/NotesStore.test.ts`
-Expected: PASS — 6 tests passed
+Expected: PASS — 8 tests passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/main/storage/NotesStore.ts src/main/storage/NotesStore.test.ts
+git add src/main/storage/atomicWrite.ts src/main/storage/NotesStore.ts src/main/storage/NotesStore.test.ts
 git commit -m "feat: add notes storage with atomic write"
 ```
 
@@ -1386,11 +1455,11 @@ Expected: FAIL — `Cannot find module './SettingsStore'`
 Create `src/main/storage/SettingsStore.ts`:
 
 ```ts
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { readFile } from 'node:fs/promises'
 import type { SettingsData } from '@shared/types'
 import { DEFAULT_MODEL } from '@shared/types'
 import { createLogger } from '@shared/logger'
+import { writeFileAtomic } from './atomicWrite'
 
 export { DEFAULT_MODEL }
 
@@ -1432,15 +1501,7 @@ export class SettingsStore {
       apiKey: patch.apiKey ?? current.apiKey,
       model: patch.model && patch.model.length > 0 ? patch.model : current.model
     }
-    await mkdir(dirname(this.filePath), { recursive: true })
-    const tempPath = `${this.filePath}.tmp`
-    try {
-      await writeFile(tempPath, JSON.stringify(next, null, 2), 'utf8')
-      await rename(tempPath, this.filePath)
-    } catch (error) {
-      await rm(tempPath, { force: true }).catch(() => undefined)
-      throw error
-    }
+    await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2))
     return next
   }
 
