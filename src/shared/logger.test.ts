@@ -211,6 +211,22 @@ describe('createLogger', () => {
       logger.info('header', { detail: 'Authorization: Basic dXNlcjpwYXNz' })
     )
     expect(output).not.toContain('dXNlcjpwYXNz')
+    expect(output).toContain('Authorization: Basic [REDACTED]')
+  })
+
+  it('redacts a standalone Basic credential in free text', () => {
+    const output = captureLog((logger) =>
+      logger.info('note', { detail: 'used Basic dXNlcjpwYXNz with nothing' })
+    )
+    expect(output).not.toContain('dXNlcjpwYXNz')
+    expect(output).toContain('Basic [REDACTED]')
+    expect(output).toContain('used')
+  })
+
+  it('redacts a lowercase bearer credential that follows a token name', () => {
+    const output = captureLog((logger) => logger.info('header', { detail: 'token: bearer 9f8e7d' }))
+    expect(output).not.toContain('9f8e7d')
+    expect(output).toContain('bearer [REDACTED]')
   })
 
   it('scrubs secrets out of the log message argument', () => {

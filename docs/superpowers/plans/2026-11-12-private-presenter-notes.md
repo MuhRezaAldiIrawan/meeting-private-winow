@@ -19,7 +19,7 @@ These apply to every task. Copy them verbatim; do not re-derive.
 - **`contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`** on the BrowserWindow.
 - **Fail-visible:** status is exactly one of `'off' | 'on' | 'error'`. `'on'` is reachable ONLY through a successful adapter call. An adapter throw yields `'error'`, never `'on'`.
 - **Protection defaults to OFF** on every launch. Default OFF is independent of the first-run notice acknowledgement flag.
-- **API key never leaves the main process.** `getSettings()` returns `{ hasApiKey: boolean, model: string, hasAcknowledgedNotice: boolean }` — never the key value. The logger redacts metadata keys by containment over normalized key names (lowercased, non-alphanumerics stripped), so `apiKey`, `api_key`, `api-key`, `DATABYTE_API_KEY`, `accessToken`, `clientSecret` and any key containing `apikey`, `authorization`, `token`, `bearer`, `password` or `secret` are replaced with `[REDACTED]`. The single carve-out is a key normalizing to `hasapikey` with a boolean value (`PublicSettings.hasApiKey`); a non-boolean under that name is still redacted. The logger also serializes `Error` as `{ name, message, stack }`, `Date` as its ISO 8601 string, scrubs secret-shaped substrings out of the log message argument and out of string values and error messages, and marks circular references as `[Circular]`. Free-text scrubbing is ordered so that an auth scheme with its credential (`Authorization: Bearer eyJ…`, `token=Bearer 9f8e7d`) is consumed as one unit and the credential is always dropped, never left standing behind the scheme word.
+- **API key never leaves the main process.** `getSettings()` returns `{ hasApiKey: boolean, model: string, hasAcknowledgedNotice: boolean }` — never the key value. The logger redacts metadata keys by containment over normalized key names (lowercased, non-alphanumerics stripped), so `apiKey`, `api_key`, `api-key`, `DATABYTE_API_KEY`, `accessToken`, `clientSecret` and any key containing `apikey`, `authorization`, `token`, `bearer`, `password` or `secret` are replaced with `[REDACTED]`. The single carve-out is a key normalizing to `hasapikey` with a boolean value (`PublicSettings.hasApiKey`); a non-boolean under that name is still redacted. The logger also serializes `Error` as `{ name, message, stack }`, `Date` as its ISO 8601 string, scrubs secret-shaped substrings out of the log message argument and out of string values and error messages, and marks circular references as `[Circular]`. Free-text scrubbing covers the `Bearer` and `Basic` auth schemes in both positions: standalone (`used Bearer abc123 alone`) and following a secret-shaped name (`Authorization: Bearer eyJ…`, `token=Bearer 9f8e7d`). The scheme word is kept and the credential is always dropped, never left standing behind the scheme word. Scheme matching is case-insensitive.
 - **UI labels are in English.** AI error messages are in **Indonesian** (PRD FR-15 explicitly requires it). This is a deliberate exception, not an inconsistency.
 - **AI Assist sends only the user's typed question.** Note content is never sent as context.
 - **All data is local.** No telemetry, no analytics, no network calls other than the AI request.
@@ -676,6 +676,22 @@ describe('createLogger', () => {
       logger.info('header', { detail: 'Authorization: Basic dXNlcjpwYXNz' })
     )
     expect(output).not.toContain('dXNlcjpwYXNz')
+    expect(output).toContain('Authorization: Basic [REDACTED]')
+  })
+
+  it('redacts a standalone Basic credential in free text', () => {
+    const output = captureLog((logger) =>
+      logger.info('note', { detail: 'used Basic dXNlcjpwYXNz with nothing' })
+    )
+    expect(output).not.toContain('dXNlcjpwYXNz')
+    expect(output).toContain('Basic [REDACTED]')
+    expect(output).toContain('used')
+  })
+
+  it('redacts a lowercase bearer credential that follows a token name', () => {
+    const output = captureLog((logger) => logger.info('header', { detail: 'token: bearer 9f8e7d' }))
+    expect(output).not.toContain('9f8e7d')
+    expect(output).toContain('bearer [REDACTED]')
   })
 
   it('scrubs secrets out of the log message argument', () => {
@@ -784,8 +800,12 @@ function isBooleanCarveOut(key: string, value: unknown): boolean {
 /** Provider API keys: `sk-...`, plus the Stripe-style `sk_live_...` / `sk_test_...` shapes. */
 const PROVIDER_KEY_PATTERN = /\bsk[-_][A-Za-z0-9_-]+/g
 
-/** `Bearer <credential>` — keeps the scheme word, drops the credential. Case-insensitive. */
-const BEARER_PATTERN = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi
+/**
+ * `Bearer <credential>` / `Basic <credential>` — keeps the scheme word, drops the credential.
+ * Case-insensitive. Covers the standalone form, where no secret-shaped name precedes the
+ * scheme; `ASSIGNED_SECRET_PATTERN` below covers the `Authorization: Bearer …` form.
+ */
+const AUTH_SCHEME_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi
 
 /**
  * `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`.
@@ -810,7 +830,7 @@ function scrubSecrets(text: string): string {
           ? `${name}${separator}${REDACTED}`
           : `${name}${separator}${scheme} ${REDACTED}`
     )
-    .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
+    .replace(AUTH_SCHEME_PATTERN, `$1 ${REDACTED}`)
     .replace(PROVIDER_KEY_PATTERN, REDACTED)
 }
 
@@ -885,7 +905,7 @@ export const logger = createLogger('app')
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/shared/logger.test.ts`
-Expected: PASS — 24 tests passed
+Expected: PASS — 26 tests passed
 
 - [ ] **Step 5: Commit**
 

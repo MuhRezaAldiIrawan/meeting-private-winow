@@ -32,8 +32,12 @@ function isBooleanCarveOut(key: string, value: unknown): boolean {
 /** Provider API keys: `sk-...`, plus the Stripe-style `sk_live_...` / `sk_test_...` shapes. */
 const PROVIDER_KEY_PATTERN = /\bsk[-_][A-Za-z0-9_-]+/g
 
-/** `Bearer <credential>` — keeps the scheme word, drops the credential. Case-insensitive. */
-const BEARER_PATTERN = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi
+/**
+ * `Bearer <credential>` / `Basic <credential>` — keeps the scheme word, drops the credential.
+ * Case-insensitive. Covers the standalone form, where no secret-shaped name precedes the
+ * scheme; `ASSIGNED_SECRET_PATTERN` below covers the `Authorization: Bearer …` form.
+ */
+const AUTH_SCHEME_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi
 
 /**
  * `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`.
@@ -58,7 +62,7 @@ function scrubSecrets(text: string): string {
           ? `${name}${separator}${REDACTED}`
           : `${name}${separator}${scheme} ${REDACTED}`
     )
-    .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
+    .replace(AUTH_SCHEME_PATTERN, `$1 ${REDACTED}`)
     .replace(PROVIDER_KEY_PATTERN, REDACTED)
 }
 
