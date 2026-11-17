@@ -90,7 +90,7 @@ describe('ProtectionService', () => {
     // `String(error)` branch of the failure path.
     const reason: unknown = 'boom'
     const service = new ProtectionService(
-      adapter(() => {
+      adapter(async () => {
         throw reason
       })
     )
@@ -100,11 +100,14 @@ describe('ProtectionService', () => {
   })
 
   it('never reports OFF when disabling fails', async () => {
-    const apply = vi.fn(async () => {
-      throw new Error('SetWindowDisplayAffinity failed')
+    // Fails only on disable, so the service reaches 'on' first and the assertion
+    // covers the 'on' -> 'error' transition rather than an already-errored state.
+    const apply = vi.fn(async (enabled: boolean) => {
+      if (!enabled) throw new Error('SetWindowDisplayAffinity failed')
     })
     const service = new ProtectionService(adapter(apply))
     await service.setEnabled(true)
+    expect(service.getSnapshot().status).toBe('on')
     const snapshot = await service.setEnabled(false)
     expect(snapshot.status).toBe('error')
     expect(snapshot.status).not.toBe('off')
