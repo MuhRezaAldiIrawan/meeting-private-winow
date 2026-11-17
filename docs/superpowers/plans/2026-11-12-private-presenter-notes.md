@@ -400,7 +400,15 @@ export default tseslint.config(
       '@typescript-eslint/no-unsafe-assignment': 'off',
       '@typescript-eslint/no-unsafe-member-access': 'off',
       '@typescript-eslint/no-unsafe-argument': 'off',
-      '@typescript-eslint/no-unsafe-call': 'off'
+      '@typescript-eslint/no-unsafe-call': 'off',
+      // An await-free async body is the idiomatic shape for a `Promise<void>` mock
+      // (`vi.fn(async () => undefined)`): the `async` keyword is what makes the stub return a
+      // promise rather than a plain value, so the await-free body is the point, not an
+      // oversight. The rule is therefore noise in test files. Scoped to `**/*.test.ts` — it
+      // stays an error in production code, where an async function with no await is a
+      // genuine mistake. `no-floating-promises` still applies everywhere and covers the
+      // common form of the mistake this relaxation could otherwise hide.
+      '@typescript-eslint/require-await': 'off'
     }
   }
 )
@@ -1003,14 +1011,18 @@ describe('ProtectionService', () => {
     await service.toggle()
     shouldFail = false
     const snapshot = await service.toggle()
+    expect(apply).toHaveBeenCalledTimes(2)
+    expect(apply).toHaveBeenLastCalledWith(true)
     expect(snapshot.status).toBe('on')
     expect(snapshot.reason).toBeNull()
   })
 
   it('records the time of the last transition', async () => {
-    const service = new ProtectionService(adapter(), () => 1_700_000_000_000)
+    let clock = 1_700_000_000_000
+    const service = new ProtectionService(adapter(), () => clock++)
+    const constructedAt = service.getSnapshot().updatedAt
     const snapshot = await service.toggle()
-    expect(snapshot.updatedAt).toBe(1_700_000_000_000)
+    expect(snapshot.updatedAt).toBeGreaterThan(constructedAt)
   })
 
   it('setEnabled(true) and setEnabled(false) are explicit', async () => {
@@ -1020,6 +1032,32 @@ describe('ProtectionService', () => {
     expect(service.getSnapshot().status).toBe('on')
     await service.setEnabled(false)
     expect(service.getSnapshot().status).toBe('off')
+  })
+
+  it('records the reason for a non-Error rejection', async () => {
+    // Typed `unknown` so the rejection reason is not an Error, exercising the
+    // `String(error)` branch of the failure path.
+    const reason: unknown = 'boom'
+    const service = new ProtectionService(
+      adapter(() => {
+        throw reason
+      })
+    )
+    const snapshot = await service.toggle()
+    expect(snapshot.status).toBe('error')
+    expect(snapshot.reason).toBe('boom')
+  })
+
+  it('never reports OFF when disabling fails', async () => {
+    const apply = vi.fn(async () => {
+      throw new Error('SetWindowDisplayAffinity failed')
+    })
+    const service = new ProtectionService(adapter(apply))
+    await service.setEnabled(true)
+    const snapshot = await service.setEnabled(false)
+    expect(snapshot.status).toBe('error')
+    expect(snapshot.status).not.toBe('off')
+    expect(snapshot.reason).toContain('SetWindowDisplayAffinity failed')
   })
 })
 ```
@@ -1043,6 +1081,7 @@ Create `src/main/protection/ProtectionService.ts`:
 
 ```ts
 import type { ProtectionSnapshot, ProtectionStatus } from '@shared/types'
+import type { ContentProtectionAdapter } from './types'
 
 export class ProtectionService {
   private status: ProtectionStatus = 'off'
@@ -1050,7 +1089,7 @@ export class ProtectionService {
   private updatedAt: number
 
   constructor(
-    private readonly adapter: { apply(enabled: boolean): Promise<void> },
+    private readonly adapter: ContentProtectionAdapter,
     private readonly now: () => number = () => Date.now()
   ) {
     this.updatedAt = this.now()
@@ -1083,7 +1122,7 @@ export class ProtectionService {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/main/protection/ProtectionService.test.ts`
-Expected: PASS — 8 tests passed
+Expected: PASS — 10 tests passed
 
 - [ ] **Step 5: Verify the module has no Electron dependency**
 

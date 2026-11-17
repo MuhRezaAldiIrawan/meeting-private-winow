@@ -1,4 +1,5 @@
 import type { ProtectionSnapshot, ProtectionStatus } from '@shared/types'
+import type { ContentProtectionAdapter } from './types'
 
 export class ProtectionService {
   private status: ProtectionStatus = 'off'
@@ -6,7 +7,7 @@ export class ProtectionService {
   private updatedAt: number
 
   constructor(
-    private readonly adapter: { apply(enabled: boolean): Promise<void> },
+    private readonly adapter: ContentProtectionAdapter,
     private readonly now: () => number = () => Date.now()
   ) {
     this.updatedAt = this.now()

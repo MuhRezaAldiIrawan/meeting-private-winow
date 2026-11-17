@@ -63,9 +63,13 @@ export default tseslint.config(
       '@typescript-eslint/no-unsafe-member-access': 'off',
       '@typescript-eslint/no-unsafe-argument': 'off',
       '@typescript-eslint/no-unsafe-call': 'off',
-      // Async mocks such as `vi.fn(async () => undefined)` must resolve rather than return a
-      // value, and `Promise.resolve()` stubs would change the shape under test. The await-free
-      // body is the point, so this rule is noise in test files.
+      // An await-free async body is the idiomatic shape for a `Promise<void>` mock
+      // (`vi.fn(async () => undefined)`): the `async` keyword is what makes the stub return a
+      // promise rather than a plain value, so the await-free body is the point, not an
+      // oversight. The rule is therefore noise in test files. Scoped to `**/*.test.ts` — it
+      // stays an error in production code, where an async function with no await is a
+      // genuine mistake. `no-floating-promises` still applies everywhere and covers the
+      // common form of the mistake this relaxation could otherwise hide.
       '@typescript-eslint/require-await': 'off'
     }
   }
