@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NotesStore } from './NotesStore'
@@ -62,6 +62,32 @@ describe('NotesStore', () => {
     expect(entries).toEqual(['notes.md'])
   })
 
+  it('removes the temporary file when the rename fails', async () => {
+    // The rename fails only when the target exists as a DIRECTORY — the one failure
+    // that happens AFTER the temp file has been written. The other failing-write case
+    // (a parent path segment that is a file) fails earlier, at `mkdir`, so it never
+    // creates a temp file and cannot prove the cleanup works.
+    const target = join(dir, 'notes.md')
+    await mkdir(target)
+    const store = new NotesStore(target)
+    await expect(store.write('new content')).rejects.toThrow()
+    const entries = await readdir(dir)
+    expect(entries).toEqual(['notes.md'])
+  })
+
+  it('writes the file atomically, never exposing a partial write', async () => {
+    // Atomic write = write to a temp file, then rename over the target. The rename
+    // swaps the file's identity, so a reader sees either the old content or the new
+    // content, never a half-written file. A direct in-place write keeps the same file
+    // and can be observed mid-write.
+    const store = new NotesStore(file)
+    await store.write('first')
+    const before = (await stat(file)).ino
+    await store.write('second')
+    const after = (await stat(file)).ino
+    expect(after).not.toBe(before)
+  })
+
   it('serializes overlapping writes without corrupting the file', async () => {
     const store = new NotesStore(file)
     await store.write('initial')
@@ -78,6 +104,33 @@ describe('NotesStore', () => {
     }
     const entries = await readdir(dir)
     expect(entries).toEqual(['notes.md'])
+  })
+
+  it('does not fail when a read overlaps a write', async () => {
+    // On Windows, renaming onto a file that another handle still has open fails with
+    // EPERM. A read racing a write therefore breaks the WRITE — the user sees a
+    // spurious "Couldn't save notes". Both operations must go through the same
+    // per-path queue so they cannot overlap.
+    const store = new NotesStore(file)
+    await store.write('initial')
+    for (let round = 0; round < 20; round++) {
+      const results = await Promise.allSettled([
+        store.write('A'.repeat(20_000)),
+        store.read()
+      ])
+      expect(results[0].status).toBe('fulfilled')
+      expect(results[1].status).toBe('fulfilled')
+    }
+  })
+
+  it('re-throws a read error that is not a missing file', async () => {
+    // Only ENOENT means "no file yet". Any other read error (here: the target is a
+    // directory) must surface, not be swallowed into an empty string — otherwise the
+    // user sees their notes silently disappear.
+    const target = join(dir, 'notes.md')
+    await mkdir(target)
+    const store = new NotesStore(target)
+    await expect(store.read()).rejects.toThrow()
   })
 
   it('overwrites existing content', async () => {
