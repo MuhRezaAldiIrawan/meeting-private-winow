@@ -19,7 +19,7 @@ These apply to every task. Copy them verbatim; do not re-derive.
 - **`contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`** on the BrowserWindow.
 - **Fail-visible:** status is exactly one of `'off' | 'on' | 'error'`. `'on'` is reachable ONLY through a successful adapter call. An adapter throw yields `'error'`, never `'on'`.
 - **Protection defaults to OFF** on every launch. Default OFF is independent of the first-run notice acknowledgement flag.
-- **API key never leaves the main process.** `getSettings()` returns `{ hasApiKey: boolean, model: string, hasAcknowledgedNotice: boolean }` — never the key value. The logger redacts metadata keys by containment over normalized key names (lowercased, non-alphanumerics stripped), so `apiKey`, `api_key`, `api-key`, `DATABYTE_API_KEY`, `accessToken`, `clientSecret` and any key containing `apikey`, `authorization`, `token`, `bearer`, `password` or `secret` are replaced with `[REDACTED]`. The single carve-out is a key normalizing to `hasapikey` with a boolean value (`PublicSettings.hasApiKey`); a non-boolean under that name is still redacted. The logger also serializes `Error` as `{ name, message, stack }`, `Date` as its ISO 8601 string, scrubs secret-shaped substrings (`sk-...`, `Bearer ...`, `token=...`) out of free text and error messages, and marks circular references as `[Circular]`.
+- **API key never leaves the main process.** `getSettings()` returns `{ hasApiKey: boolean, model: string, hasAcknowledgedNotice: boolean }` — never the key value. The logger redacts metadata keys by containment over normalized key names (lowercased, non-alphanumerics stripped), so `apiKey`, `api_key`, `api-key`, `DATABYTE_API_KEY`, `accessToken`, `clientSecret` and any key containing `apikey`, `authorization`, `token`, `bearer`, `password` or `secret` are replaced with `[REDACTED]`. The single carve-out is a key normalizing to `hasapikey` with a boolean value (`PublicSettings.hasApiKey`); a non-boolean under that name is still redacted. The logger also serializes `Error` as `{ name, message, stack }`, `Date` as its ISO 8601 string, scrubs secret-shaped substrings out of the log message argument and out of string values and error messages, and marks circular references as `[Circular]`. Free-text scrubbing is ordered so that an auth scheme with its credential (`Authorization: Bearer eyJ…`, `token=Bearer 9f8e7d`) is consumed as one unit and the credential is always dropped, never left standing behind the scheme word.
 - **UI labels are in English.** AI error messages are in **Indonesian** (PRD FR-15 explicitly requires it). This is a deliberate exception, not an inconsistency.
 - **AI Assist sends only the user's typed question.** Note content is never sent as context.
 - **All data is local.** No telemetry, no analytics, no network calls other than the AI request.
@@ -640,6 +640,57 @@ describe('createLogger', () => {
     expect(output).toContain('Bearer [REDACTED]')
     expect(output).toContain('used')
   })
+
+  it('redacts a Bearer credential that follows an Authorization header name', () => {
+    const output = captureLog((logger) =>
+      logger.info('header', { detail: 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig' })
+    )
+    expect(output).not.toContain('eyJhbGciOiJIUzI1NiJ9.payload.sig')
+    expect(output).toContain('Authorization: Bearer [REDACTED]')
+  })
+
+  it('redacts a Bearer credential assigned to an authorization field', () => {
+    const output = captureLog((logger) =>
+      logger.info('header', { detail: 'authorization=Bearer 9f8e7d' })
+    )
+    expect(output).not.toContain('9f8e7d')
+    expect(output).toContain('Bearer [REDACTED]')
+  })
+
+  it('redacts a Bearer credential that follows a token name', () => {
+    const output = captureLog((logger) => logger.info('header', { detail: 'token: Bearer 9f8e7d' }))
+    expect(output).not.toContain('9f8e7d')
+    expect(output).toContain('Bearer [REDACTED]')
+  })
+
+  it('redacts a Bearer credential inside an Error message', () => {
+    const output = captureLog((logger) =>
+      logger.error('request failed', { err: new Error('Authorization: Bearer jwt-payload') })
+    )
+    expect(output).not.toContain('jwt-payload')
+    expect(output).toContain('Bearer [REDACTED]')
+  })
+
+  it('redacts a Basic credential that follows an Authorization header name', () => {
+    const output = captureLog((logger) =>
+      logger.info('header', { detail: 'Authorization: Basic dXNlcjpwYXNz' })
+    )
+    expect(output).not.toContain('dXNlcjpwYXNz')
+  })
+
+  it('scrubs secrets out of the log message argument', () => {
+    const output = captureLog((logger) => logger.error('request failed with sk-db-secret'))
+    expect(output).not.toContain('sk-db-secret')
+    expect(output).toContain('request failed with')
+  })
+
+  it('does not throw on an invalid Date and still emits the line', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const logger = createLogger('main')
+    expect(() => logger.info('stamp', { at: new Date('garbage') })).not.toThrow()
+    const output = spy.mock.calls.map((c) => c.join(' ')).join('\n')
+    expect(output).toContain('Invalid Date')
+  })
 })
 ```
 
@@ -736,17 +787,29 @@ const PROVIDER_KEY_PATTERN = /\bsk[-_][A-Za-z0-9_-]+/g
 /** `Bearer <credential>` — keeps the scheme word, drops the credential. Case-insensitive. */
 const BEARER_PATTERN = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi
 
-/** `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`. */
+/**
+ * `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`.
+ * The value class has a dedicated `<scheme> <credential>` branch, tried BEFORE the generic
+ * token branch, so `Authorization: Bearer eyJ…` is consumed as one unit. Without it the
+ * generic branch would stop at the scheme word and leave the credential standing.
+ */
 const ASSIGNED_SECRET_PATTERN =
-  /\b(api[_-]?key|authorization|token|secret|password)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi
+  /\b(api[_-]?key|authorization|token|secret|password)(\s*[=:]\s*)("(?:[^"]*)"|'(?:[^']*)'|(Bearer|Basic)\s+[^\s,;]+|[^\s,;]+)/gi
 
 /**
- * Removes secret-shaped substrings from free text. Used for string metadata values and for
- * `Error` messages/stacks, which are diagnostic text we cannot otherwise key-match.
+ * Removes secret-shaped substrings from free text. Used for string metadata values, for
+ * `Error` messages/stacks, and for the log message argument — all places where diagnostic
+ * text we cannot key-match might carry a credential.
  */
 function scrubSecrets(text: string): string {
   return text
-    .replace(ASSIGNED_SECRET_PATTERN, (_match, name: string, separator: string) => `${name}${separator}${REDACTED}`)
+    .replace(
+      ASSIGNED_SECRET_PATTERN,
+      (_match: string, name: string, separator: string, _value: string, scheme: string | undefined) =>
+        scheme === undefined
+          ? `${name}${separator}${REDACTED}`
+          : `${name}${separator}${scheme} ${REDACTED}`
+    )
     .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
     .replace(PROVIDER_KEY_PATTERN, REDACTED)
 }
@@ -764,7 +827,11 @@ export interface Logger {
  */
 function walk(value: unknown, seen: WeakSet<object>): unknown {
   if (typeof value === 'string') return scrubSecrets(value)
-  if (value instanceof Date) return value.toISOString()
+  if (value instanceof Date) {
+    // An invalid Date throws on toISOString(); never let the logger itself throw and mask
+    // the error the caller was trying to report.
+    return Number.isNaN(value.getTime()) ? String(value) : value.toISOString()
+  }
   if (value instanceof Error) {
     return {
       name: scrubSecrets(value.name),
@@ -803,7 +870,7 @@ function redact(value: unknown): unknown {
 export function createLogger(scope: string): Logger {
   const emit = (level: 'info' | 'warn' | 'error', message: string, meta?: Record<string, unknown>) => {
     const payload = meta === undefined ? '' : ` ${JSON.stringify(redact(meta))}`
-    console.log(`[${scope}] ${level}: ${message}${payload}`)
+    console.log(`[${scope}] ${level}: ${scrubSecrets(message)}${payload}`)
   }
   return {
     info: (message, meta) => emit('info', message, meta),
@@ -818,7 +885,7 @@ export const logger = createLogger('app')
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/shared/logger.test.ts`
-Expected: PASS — 17 tests passed
+Expected: PASS — 24 tests passed
 
 - [ ] **Step 5: Commit**
 

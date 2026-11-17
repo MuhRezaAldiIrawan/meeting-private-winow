@@ -175,4 +175,55 @@ describe('createLogger', () => {
     expect(output).toContain('Bearer [REDACTED]')
     expect(output).toContain('used')
   })
+
+  it('redacts a Bearer credential that follows an Authorization header name', () => {
+    const output = captureLog((logger) =>
+      logger.info('header', { detail: 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig' })
+    )
+    expect(output).not.toContain('eyJhbGciOiJIUzI1NiJ9.payload.sig')
+    expect(output).toContain('Authorization: Bearer [REDACTED]')
+  })
+
+  it('redacts a Bearer credential assigned to an authorization field', () => {
+    const output = captureLog((logger) =>
+      logger.info('header', { detail: 'authorization=Bearer 9f8e7d' })
+    )
+    expect(output).not.toContain('9f8e7d')
+    expect(output).toContain('Bearer [REDACTED]')
+  })
+
+  it('redacts a Bearer credential that follows a token name', () => {
+    const output = captureLog((logger) => logger.info('header', { detail: 'token: Bearer 9f8e7d' }))
+    expect(output).not.toContain('9f8e7d')
+    expect(output).toContain('Bearer [REDACTED]')
+  })
+
+  it('redacts a Bearer credential inside an Error message', () => {
+    const output = captureLog((logger) =>
+      logger.error('request failed', { err: new Error('Authorization: Bearer jwt-payload') })
+    )
+    expect(output).not.toContain('jwt-payload')
+    expect(output).toContain('Bearer [REDACTED]')
+  })
+
+  it('redacts a Basic credential that follows an Authorization header name', () => {
+    const output = captureLog((logger) =>
+      logger.info('header', { detail: 'Authorization: Basic dXNlcjpwYXNz' })
+    )
+    expect(output).not.toContain('dXNlcjpwYXNz')
+  })
+
+  it('scrubs secrets out of the log message argument', () => {
+    const output = captureLog((logger) => logger.error('request failed with sk-db-secret'))
+    expect(output).not.toContain('sk-db-secret')
+    expect(output).toContain('request failed with')
+  })
+
+  it('does not throw on an invalid Date and still emits the line', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const logger = createLogger('main')
+    expect(() => logger.info('stamp', { at: new Date('garbage') })).not.toThrow()
+    const output = spy.mock.calls.map((c) => c.join(' ')).join('\n')
+    expect(output).toContain('Invalid Date')
+  })
 })

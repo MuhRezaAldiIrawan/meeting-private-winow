@@ -35,17 +35,29 @@ const PROVIDER_KEY_PATTERN = /\bsk[-_][A-Za-z0-9_-]+/g
 /** `Bearer <credential>` — keeps the scheme word, drops the credential. Case-insensitive. */
 const BEARER_PATTERN = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi
 
-/** `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`. */
+/**
+ * `key=value` / `key: value` for secret-shaped names, e.g. `api_key=xyz`, `token: xyz`.
+ * The value class has a dedicated `<scheme> <credential>` branch, tried BEFORE the generic
+ * token branch, so `Authorization: Bearer eyJ…` is consumed as one unit. Without it the
+ * generic branch would stop at the scheme word and leave the credential standing.
+ */
 const ASSIGNED_SECRET_PATTERN =
-  /\b(api[_-]?key|authorization|token|secret|password)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi
+  /\b(api[_-]?key|authorization|token|secret|password)(\s*[=:]\s*)("(?:[^"]*)"|'(?:[^']*)'|(Bearer|Basic)\s+[^\s,;]+|[^\s,;]+)/gi
 
 /**
- * Removes secret-shaped substrings from free text. Used for string metadata values and for
- * `Error` messages/stacks, which are diagnostic text we cannot otherwise key-match.
+ * Removes secret-shaped substrings from free text. Used for string metadata values, for
+ * `Error` messages/stacks, and for the log message argument — all places where diagnostic
+ * text we cannot key-match might carry a credential.
  */
 function scrubSecrets(text: string): string {
   return text
-    .replace(ASSIGNED_SECRET_PATTERN, (_match, name: string, separator: string) => `${name}${separator}${REDACTED}`)
+    .replace(
+      ASSIGNED_SECRET_PATTERN,
+      (_match: string, name: string, separator: string, _value: string, scheme: string | undefined) =>
+        scheme === undefined
+          ? `${name}${separator}${REDACTED}`
+          : `${name}${separator}${scheme} ${REDACTED}`
+    )
     .replace(BEARER_PATTERN, `$1 ${REDACTED}`)
     .replace(PROVIDER_KEY_PATTERN, REDACTED)
 }
@@ -63,7 +75,11 @@ export interface Logger {
  */
 function walk(value: unknown, seen: WeakSet<object>): unknown {
   if (typeof value === 'string') return scrubSecrets(value)
-  if (value instanceof Date) return value.toISOString()
+  if (value instanceof Date) {
+    // An invalid Date throws on toISOString(); never let the logger itself throw and mask
+    // the error the caller was trying to report.
+    return Number.isNaN(value.getTime()) ? String(value) : value.toISOString()
+  }
   if (value instanceof Error) {
     return {
       name: scrubSecrets(value.name),
@@ -102,7 +118,7 @@ function redact(value: unknown): unknown {
 export function createLogger(scope: string): Logger {
   const emit = (level: 'info' | 'warn' | 'error', message: string, meta?: Record<string, unknown>) => {
     const payload = meta === undefined ? '' : ` ${JSON.stringify(redact(meta))}`
-    console.log(`[${scope}] ${level}: ${message}${payload}`)
+    console.log(`[${scope}] ${level}: ${scrubSecrets(message)}${payload}`)
   }
   return {
     info: (message, meta) => emit('info', message, meta),
