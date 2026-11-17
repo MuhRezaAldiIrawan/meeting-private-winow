@@ -1151,7 +1151,7 @@ git commit -m "feat: add pure protection state machine with fail-visible semanti
 **Interfaces:**
 - Consumes: nothing (pure `node:fs`)
 - Produces:
-  - `writeFileAtomic(filePath: string, content: string): Promise<void>` in `src/main/storage/atomicWrite.ts` — shared by `NotesStore` (Task 4) and `SettingsStore` (Task 5)
+  - `writeFileAtomic(filePath: string, content: string): Promise<void>` and `updateFileAtomic(filePath: string, update: (current: string) => string): Promise<string>` in `src/main/storage/atomicWrite.ts` — shared by `NotesStore` (Task 4) and `SettingsStore` (Task 5)
   - `class NotesStore`
     - `constructor(filePath: string)`
     - `async read(): Promise<string>`
@@ -1163,7 +1163,7 @@ Create `src/main/storage/NotesStore.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, readFile, readdir, rm, writeFile, mkdir } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NotesStore } from './NotesStore'
@@ -1263,7 +1263,7 @@ Expected: FAIL — `Cannot find module './NotesStore'`
 Create `src/main/storage/atomicWrite.ts`:
 
 ```ts
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 /**
@@ -1275,10 +1275,14 @@ const queues = new Map<string, Promise<void>>()
 
 let tempCounter = 0
 
-export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+/**
+ * Runs `task` after any previously queued task for the same path has settled, so tasks
+ * touching one file are executed one at a time.
+ */
+function enqueue<T>(filePath: string, task: () => Promise<T>): Promise<T> {
   const key = resolve(filePath)
   const previous = queues.get(key) ?? Promise.resolve()
-  const current = previous.then(() => writeAtomic(filePath, content))
+  const current = previous.then(task)
   // The queue must survive a failed write, so it tracks the settled promise.
   const settled = current.then(
     () => undefined,
@@ -1289,6 +1293,37 @@ export async function writeFileAtomic(filePath: string, content: string): Promis
     if (queues.get(key) === settled) queues.delete(key)
   })
   return current
+}
+
+export function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  return enqueue(filePath, () => writeAtomic(filePath, content))
+}
+
+/**
+ * Reads the current contents, derives the next contents and writes them — all inside the
+ * per-path critical section. A caller that reads the file, then writes it back, must use
+ * this instead of `writeFileAtomic`: between the read and the write another writer could
+ * change the file, and the second writer's change would be silently lost.
+ */
+export function updateFileAtomic(
+  filePath: string,
+  update: (current: string) => string
+): Promise<string> {
+  return enqueue(filePath, async () => {
+    const current = await readFileIfExists(filePath)
+    const next = update(current)
+    await writeAtomic(filePath, next)
+    return next
+  })
+}
+
+async function readFileIfExists(filePath: string): Promise<string> {
+  try {
+    return await readFile(filePath, 'utf8')
+  } catch (error) {
+    if (isNotFound(error)) return ''
+    throw error
+  }
 }
 
 async function writeAtomic(filePath: string, content: string): Promise<void> {
@@ -1302,6 +1337,14 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
     await rm(tempPath, { force: true }).catch(() => undefined)
     throw error
   }
+}
+
+function isNotFound(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: string }).code === 'ENOENT'
+  )
 }
 ```
 
@@ -1442,6 +1485,25 @@ describe('SettingsStore', () => {
     const store = new SettingsStore(file)
     await expect(store.getModel()).resolves.toBe(DEFAULT_MODEL)
   })
+
+  it('does not lose a concurrent partial update', async () => {
+    const store = new SettingsStore(file)
+    // Two writers touch different fields at the same time — e.g. the user saves their
+    // API key while the first-run notice is being acknowledged. A read-modify-write
+    // outside the per-path critical section drops one of the two updates: the second
+    // writer reads the file before the first writer's write lands, then overwrites it.
+    // Repeat enough rounds that the race is caught reliably rather than one time in four.
+    for (let round = 0; round < 20; round++) {
+      await rm(file, { force: true })
+      await Promise.all([
+        store.write({ apiKey: 'sk-db-abc123' }),
+        store.write({ hasAcknowledgedNotice: true })
+      ])
+      const data = await store.read()
+      expect(data.apiKey).toBe('sk-db-abc123')
+      expect(data.hasAcknowledgedNotice).toBe(true)
+    }
+  })
 })
 ```
 
@@ -1459,7 +1521,7 @@ import { readFile } from 'node:fs/promises'
 import type { SettingsData } from '@shared/types'
 import { DEFAULT_MODEL } from '@shared/types'
 import { createLogger } from '@shared/logger'
-import { writeFileAtomic } from './atomicWrite'
+import { updateFileAtomic } from './atomicWrite'
 
 export { DEFAULT_MODEL }
 
@@ -1469,40 +1531,29 @@ export class SettingsStore {
   constructor(private readonly filePath: string) {}
 
   async read(): Promise<SettingsData> {
-    const defaults: SettingsData = {
-      hasAcknowledgedNotice: false,
-      apiKey: '',
-      model: DEFAULT_MODEL
-    }
     try {
-      const raw = await readFile(this.filePath, 'utf8')
-      const parsed: unknown = JSON.parse(raw)
-      if (typeof parsed !== 'object' || parsed === null) return defaults
-      const data = parsed as Partial<SettingsData>
-      return {
-        hasAcknowledgedNotice:
-          typeof data.hasAcknowledgedNotice === 'boolean'
-            ? data.hasAcknowledgedNotice
-            : defaults.hasAcknowledgedNotice,
-        apiKey: typeof data.apiKey === 'string' ? data.apiKey : defaults.apiKey,
-        model: typeof data.model === 'string' && data.model.length > 0 ? data.model : defaults.model
-      }
+      return parseSettings(await readFile(this.filePath, 'utf8'))
     } catch (error) {
-      if (isNotFound(error)) return defaults
+      if (isNotFound(error)) return defaultSettings()
       log.warn('settings file unreadable, using defaults', { error: String(error) })
-      return defaults
+      return defaultSettings()
     }
   }
 
   async write(patch: Partial<SettingsData>): Promise<SettingsData> {
-    const current = await this.read()
-    const next: SettingsData = {
-      hasAcknowledgedNotice: patch.hasAcknowledgedNotice ?? current.hasAcknowledgedNotice,
-      apiKey: patch.apiKey ?? current.apiKey,
-      model: patch.model && patch.model.length > 0 ? patch.model : current.model
-    }
-    await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2))
-    return next
+    // The read-modify-write must happen inside the per-path critical section. Reading
+    // the file first and writing afterwards lets a concurrent writer change the file in
+    // between, and the second write then silently discards the first writer's change.
+    const written = await updateFileAtomic(this.filePath, (raw) => {
+      const current = parseSettings(raw)
+      const next: SettingsData = {
+        hasAcknowledgedNotice: patch.hasAcknowledgedNotice ?? current.hasAcknowledgedNotice,
+        apiKey: patch.apiKey ?? current.apiKey,
+        model: patch.model && patch.model.length > 0 ? patch.model : current.model
+      }
+      return JSON.stringify(next, null, 2)
+    })
+    return parseSettings(written)
   }
 
   async getApiKey(): Promise<string> {
@@ -1511,6 +1562,33 @@ export class SettingsStore {
 
   async getModel(): Promise<string> {
     return (await this.read()).model
+  }
+}
+
+function defaultSettings(): SettingsData {
+  return { hasAcknowledgedNotice: false, apiKey: '', model: DEFAULT_MODEL }
+}
+
+/** Parses the stored JSON, falling back to defaults for anything malformed. */
+function parseSettings(raw: string): SettingsData {
+  const defaults = defaultSettings()
+  if (raw.trim().length === 0) return defaults
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    log.warn('settings file unreadable, using defaults', { error: String(error) })
+    return defaults
+  }
+  if (typeof parsed !== 'object' || parsed === null) return defaults
+  const data = parsed as Partial<SettingsData>
+  return {
+    hasAcknowledgedNotice:
+      typeof data.hasAcknowledgedNotice === 'boolean'
+        ? data.hasAcknowledgedNotice
+        : defaults.hasAcknowledgedNotice,
+    apiKey: typeof data.apiKey === 'string' ? data.apiKey : defaults.apiKey,
+    model: typeof data.model === 'string' && data.model.length > 0 ? data.model : defaults.model
   }
 }
 
@@ -1526,7 +1604,7 @@ function isNotFound(error: unknown): boolean {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run src/main/storage/SettingsStore.test.ts`
-Expected: PASS — 7 tests passed
+Expected: PASS — 8 tests passed
 
 - [ ] **Step 5: Commit**
 
